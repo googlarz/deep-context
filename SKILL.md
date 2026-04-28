@@ -15,9 +15,9 @@ Pick based on user input:
 |------|---------|--------|
 | **build** | folder path + "scan/ingest/build context" | Full workflow (steps 1–8 below) |
 | **build with anchors** | folder + 3–5 anchor questions ("how does X work?") | Build, then verify pack can answer each anchor with HIGH confidence; unanswerable anchors → Gaps |
-| **ask** | existing `.context/` + a question, e.g. `/context-pack ask <folder> "<question>"` | Skip to step 9 — answer from cached notes |
+| **ask** | existing `.context/` + a question, e.g. `/deep-context ask <folder> "<question>"` | Skip to step 9 — answer from cached notes |
 | **diff** | cache hit on rebuild, ≥1 file changed | Run build on changed files only, then write `CHANGES.md` summarizing what's new since last run; run drift detection on dependent notes |
-| **link** | `/context-pack link <folder-a> <folder-b>` | Cross-link two existing packs — see step 11 |
+| **link** | `/deep-context link <folder-a> <folder-b>` | Cross-link two existing packs — see step 11 |
 
 Default to **build** if mode is ambiguous and `.context/` doesn't exist; default to **diff** if it exists and any file changed; default to **ask** if user passes a question alongside an unchanged corpus.
 
@@ -51,9 +51,21 @@ If the user passes `--domain=<legal|code|sales|research|finance|medical>` or the
 - **sales**: account, deal stage, ACV, close date, decision-makers, objections
 - **research**: hypothesis, method, sample size, findings, confidence level, citations
 - **finance**: amounts, currency, dates, parties, account/invoice numbers, due dates, status (paid/outstanding)
-- **medical**: patient identifiers (flag PII!), diagnoses, medications, dosages, dates of service, providers
+- **medical**: diagnoses (de-identified), medications, dosages, dates of service, providers, encounter types — **NEVER raw patient identifiers (name, MRN, DOB, SSN, address, phone, email) by default**
 
 If no domain hint is provided AND the corpus is mixed, skip domain enrichment and use the generic schema. **Domain templates are additive — they don't replace the standard Purpose/Key content/etc. sections.**
+
+**PHI/PII redaction (medical mode — mandatory ask):**
+
+When `--domain=medical`, before any extraction, ask the user exactly once:
+
+> "Medical mode persists derived notes under `.context/`. Default is to **redact patient identifiers** (name, MRN, DOB, SSN, address, phone, email → `[REDACTED:<type>]` tokens) so PHI doesn't propagate into per-file notes, DIGEST.md, GLOSSARY.md, or `index.json`. Override?
+> - **Default (recommended): redact PHI in all `.context/` outputs**
+> - Keep raw identifiers (requires explicit confirmation; never appears in DIGEST/JSON regardless)"
+
+Default is redact. Even if the user opts to keep raw identifiers, **DIGEST.md, GLOSSARY.md, CONFLICTS.md, RED_TEAM.md, SELF_TEST.md, and `index.json` MUST still redact** — those are the most likely artifacts to be shared, pasted, or committed. Raw identifiers, if kept, only ever appear in per-file notes.
+
+Record the choice in `.context/REDACTION.md` with timestamp + chosen mode + scope.
 
 ### 0. Ask for anchors (before scanning)
 
@@ -95,7 +107,33 @@ For corpora >30 files, **delegate extraction to `Explore` subagents** to keep ra
 
 - Partition the work set into batches of ~25 files each.
 - Spawn one `Explore` subagent per batch in parallel (single message, multiple tool calls).
-- Each subagent's prompt: "Read these N files. For each, write `<.context/files/<relpath>.md>` following the schema in `~/.claude/skills/context-pack/SKILL.md` step 4. Do BOTH passes (extract + self-verify). Return only: list of files written, list of citation failures, list of files you could not read."
+- Each subagent's prompt MUST be self-contained (do not reference this SKILL.md by path — installations may vary). Inline the full extraction schema in the prompt:
+
+  ```
+  Read these N files. For each, produce `.context/files/<relpath>.md` with this exact frontmatter+sections schema:
+
+  Frontmatter: path, sha256, size, lines OR pages_total/pages_read, scanned_at.
+
+  Sections (in order):
+  ## Purpose (cite source)        — 1-2 sentences, with citation
+  ## Key content                  — bulleted, every line with citation tag (type:loc) name: one-line
+  ## References out               — outbound refs with citation
+  ## Does NOT cover               — explicit negative space
+  ## Open questions               — anything <90% confident
+  ## TODO/FIXME/HACK              — verbatim with location
+  ## Confidence                   — HIGH/MEDIUM/LOW + reason
+
+  Citation format by file type:
+  - text/code/markdown: (L<a>-L<b>)
+  - PDFs: (p<n> ¶<m>) or (p<n> §<id>)  — sub-page anchor mandatory if page has >30 lines
+  - spreadsheets: (<sheet>!<range>)
+
+  Mandatory two passes:
+  - Pass A: extract.
+  - Pass B: re-read each cited location and confirm support. Demote any unsupported claim to Open questions.
+
+  Return only: files written, citation failures, files you could not read.
+  ```
 - Subagents must Read+Write only — do not let them modify source files.
 - Main agent then runs steps 5–8 on the resulting notes (cross-index, verification, INDEX, manifest).
 
@@ -186,7 +224,7 @@ After all per-file notes are written, build:
 
 **Mandatory for corpora ≥10 files.** For corpora <10 files, run an inline skeptical re-read instead (cheaper, less independent — must be flagged in RED_TEAM.md as a deviation). For ≥10 files, spawn one or more *separate* `Explore` subagents — different from the agents that wrote the notes. Their job is to disprove claims, not confirm them.
 
-Per batch (~25 notes per agent), prompt: "You are a skeptical reviewer. For each per-file note in this batch, read the source file and try to find: (a) any claim NOT supported by the cited line range, (b) any claim that's technically true but misleading, (c) any important content in the source that the note OMITS. Output a list per note: `<note path>: PASS` or `<note path>: FAIL — <specific issue> (src L<a>-L<b>)`."
+Per batch (~25 notes per agent), prompt: "You are a skeptical reviewer. For each per-file note in this batch, read the source file and try to find: (a) any claim NOT supported by the cited line range, (b) any claim that's technically true but misleading, (c) any important content in the source that the note OMITS. Output a list per note: `<note path>: PASS` or `<note path>: FAIL — <specific issue> (src <citation>)`."
 
 Aggregate findings into `.context/RED_TEAM.md`:
 
@@ -200,7 +238,7 @@ Aggregate findings into `.context/RED_TEAM.md`:
 - Pass rate: <%>
 
 ## Failures
-- [<note>](.context/files/<path>.md) — <issue> — src L<a>-L<b>
+- [<note>](.context/files/<path>.md) — <issue> — src <citation>
 - ...
 
 ## Omissions
@@ -225,7 +263,7 @@ Pass rate: <%>
 - Q: <question>
   A: <answer from notes>
   Grade: PASS | FAIL — <reason>
-  Source check: src L<a>-L<b>
+  Source check: src <citation>
 ```
 
 Self-test pass rate is reported in INDEX.md as the empirical accuracy number — it overrides any self-reported confidence. **A pack with self-test pass rate <90% cannot claim `coverage: 100`.**
@@ -237,7 +275,7 @@ Fill this checklist explicitly in INDEX.md. Each line gets ✓ or ✗ with evide
 - [ ] Inventory count matches per-file note count
 - [ ] Every file in manifest has a corresponding `.context/files/<relpath>.md`
 - [ ] Every per-file note has Pass A + Pass B completed
-- [ ] Every claim in Purpose / Key content / References carries a `(L<a>-L<b>)` citation
+- [ ] Every claim in Purpose / Key content / References carries a citation in the correct form for its file type: `(L<a>-L<b>)` for text/code/markdown, `(p<n> ¶<m>)` or `(p<n> §<id>)` for PDFs, `(<sheet>!<range>)` for spreadsheets. **Bare `(p<n>)` is only acceptable for PDF pages with ≤30 lines.** Mixed-format citations are valid as long as each matches its source's type.
 - [ ] **Spot-check audit**: pick a random 10% sample of cited claims, re-read the source line ranges, confirm each claim is supported. Report sample size, pass rate, and any failures by name.
 - [ ] Every TODO/FIXME/HACK in source appears in a per-file note (grep source for `TODO|FIXME|HACK|XXX` and cross-check)
 - [ ] Every cross-reference resolves (or is listed under "dangling references")
@@ -247,7 +285,7 @@ Fill this checklist explicitly in INDEX.md. Each line gets ✓ or ✗ with evide
 - [ ] Self-test calibration run. Empirical pass rate reported.
 - [ ] If anchor questions provided: each anchor answered with HIGH confidence using only `.context/`. Unanswerable anchors → Gaps.
 - [ ] No per-file note has empty Purpose, Confidence, or "Does NOT cover"
-- [ ] Coverage gate: spot-check pass rate ≥95% AND red team pass rate ≥90% AND self-test pass rate ≥90% AND every anchor answered AND zero LOW-confidence files unflagged in Gaps → only then mark `coverage: 100`
+- [ ] Coverage gate: spot-check pass rate ≥95% AND red team pass rate ≥90% AND self-test pass rate ≥90% AND every anchor answered AND zero LOW-confidence files unflagged in Gaps AND (for PDFs) `pages_read == pages_total` AND end-of-document signature verified → only then mark `coverage: 100`. Citation-format violations (using `(L<a>-L<b>)` on a PDF claim, etc.) count as failures and bar `coverage: 100`.
 
 If any check fails: do not mark `coverage: 100`. List the failures in INDEX.md under "Gaps".
 
@@ -354,7 +392,7 @@ When invoked as `ask` with a question:
 - Require `.context/manifest.json` with `coverage: 100`. If missing or partial, refuse and tell the user to run build first.
 - Read `INDEX.md`, `GLOSSARY.md`, `CONFLICTS.md`, and per-file notes whose Purpose or Key content matches the question (grep the notes, not source files).
 - If the cached notes don't contain the answer, fall back to reading the cited source line ranges directly — never guess.
-- Answer with citations to per-file notes AND the original source line ranges (`[<file>](.context/files/<path>.md) → src L<a>-L<b>`).
+- Answer with citations to per-file notes AND the original source line ranges (`[<file>](.context/files/<path>.md) → src <citation>`).
 - If you cannot answer with ≥HIGH confidence from cached material, say so explicitly and list what's missing.
 
 ### 10. Diff mode
@@ -363,7 +401,11 @@ When invoked on a corpus that already has `.context/` from a prior 100% run:
 
 - Compute current vs cached manifest. Identify added / modified / deleted files.
 - Run steps 3–6 on added + modified only. Delete per-file notes for removed source files. Update `manifest.json`.
-- **Drift detection**: for each modified file, identify per-file notes in OTHER files whose `References out` pointed at the changed line ranges. Flag those notes in `CHANGES.md` under "Possibly stale" — their citations may now be wrong. The skill does not auto-rewrite them; user decides whether to re-run those notes.
+- **Drift detection + dependent invalidation (mandatory)**: for each modified file, identify per-file notes in OTHER files whose `References out` pointed at the changed file or its line ranges. Those dependent notes are **automatically invalidated** and added to the work set for re-extraction (Pass A + Pass B + red-team for that batch). Same for notes that mention any deleted file by name.
+
+  **Coverage rule**: `coverage: 100` is forbidden until every invalidated dependent note has been re-extracted and re-verified. If invalidation expands the work set substantially and the user wants a partial result, write `coverage: partial` with `gaps: ["dependent notes pending re-extraction: <list>"]` and refuse `ask` mode until rebuild completes.
+
+  This closes the stale-cache hole: `ask` only ever trusts notes whose underlying source has not changed since extraction. CHANGES.md still lists which files were invalidated and re-extracted, but they are no longer left as advisory "Possibly stale" — they are rebuilt or the pack is downgraded.
 - Write `.context/CHANGES.md`:
 
 ```markdown
@@ -393,7 +435,7 @@ CHANGES.md is overwritten on each diff run (it represents the latest delta only)
 
 ### 11. Link mode (cross-pack)
 
-When invoked as `/context-pack link <folder-a> <folder-b>`:
+When invoked as `/deep-context link <folder-a> <folder-b>`:
 
 - Both folders must have `.context/manifest.json` with `coverage: 100`. Refuse if either is missing or partial.
 - Read both INDEX.md + GLOSSARY.md.
@@ -412,7 +454,7 @@ When invoked as `/context-pack link <folder-a> <folder-b>`:
 - ...
 
 ## Conflicts across packs
-- A claims <X> (src L<a>-L<b>); B claims <Y> (src L<c>-L<d>) — disagreement on <topic>
+- A claims <X> (src <citation>); B claims <Y> (src L<c>-L<d>) — disagreement on <topic>
 ```
 
 Link mode is idempotent — re-running updates LINKS.md but never touches per-file notes.
