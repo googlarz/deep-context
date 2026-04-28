@@ -21,6 +21,29 @@ Most context-loading is RAG: retrieve at query time, rediscover knowledge each c
 
 It's designed for the cases where "scan everything thoroughly" is actually tractable: a focused dossier, a small repo, a research folder, a dossier of contracts. At ≤200 files, full reads are cheap; the value is in **verified completeness** and an **actionable digest**, not retrieval latency.
 
+## When to use this over built-in context tools
+
+The default context-loading paths in agents (raw `Read`, glob+grep, naive RAG retrieval, "just paste it in") are usually fine for casual exploration — and they're cheaper. But they share a failure mode that matters when the corpus is consequential: **you don't know what was missed, what was hallucinated, or whether the answer the agent gave you is actually grounded in the source.**
+
+Use `deep-context` when the cost of a confidently-wrong answer is higher than the cost of extra tokens:
+
+- **Legal / contracts / regulatory** — a missed clause or a hallucinated deadline is expensive
+- **Financial dossiers** — an aggregated total that secretly double-counts or skips a currency conversion is worse than no total at all
+- **Medical / clinical** — built-ins have no PHI awareness; this skill has explicit (best-effort) redaction policy
+- **Audit, due diligence, M&A** — you need an artifact you can defend, with citations
+- **Research synthesis where the conclusions will be cited** — you need to know what the corpus actually says vs what the agent imagined
+- **Any "trust me" output you'd be embarrassed to find was wrong**
+
+What you're paying for vs the built-ins:
+- **Mandatory source citations on every claim** — no claim without a verifiable pointer
+- **Independent red-team pass** — a separate agent tries to *disprove* claims, not confirm them
+- **Source-derived omission probe** — a fourth audit direction that asks "what's NOT in the notes that should be?" — closes the structural blind spot in note-only verification
+- **Hostile-content guard** — corpus content cannot inject instructions into the extractor
+- **Symlink/realpath boundary** — scan stays inside the folder you pointed at, period
+- **Coverage gate that admits uncertainty** — `coverage: partial` is the honest default when something's incomplete; `coverage: 100` is gated on multiple measured pass rates
+
+The tradeoff is straightforward: roughly 3–10× the tokens of a casual scan, in exchange for an artifact that tells you what it knows, what it doesn't, and why each claim should be believed. If the corpus doesn't matter, don't use this. If it does, the extra cost is the cheapest part of the workflow.
+
 ## Modes
 
 | Mode | Trigger | Action |
