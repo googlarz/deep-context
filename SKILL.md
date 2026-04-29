@@ -34,6 +34,7 @@ Inside the target folder:
 ├── CONFLICTS.md          # contradictions between per-file notes (may be empty)
 ├── GLOSSARY.md           # cross-corpus terms and entities (may be empty)
 ├── manifest.json         # {path, sha256, size, mtime, scanned_at} per file + run metadata
+├── ASK_LOG.md            # append-only log of ask-mode misses (excluded from note integrity hashing)
 └── files/
     └── <relpath>.md      # one note per source file, mirrors source tree
 ```
@@ -77,15 +78,15 @@ Default = full redaction + scrub. Even with overrides, **DIGEST.md, GLOSSARY.md,
 
 **Mandatory final scrub — atomic write protocol (cannot be disabled if default policy chosen):**
 
-To guarantee that PHI never reaches the final `.context/` path even on a failed run:
+> ⚠️ **Scope of protection**: this scrub covers only the files written to `.context/`. It does NOT protect model inference transcripts, tool call logs, editor history, OS filesystem journals, cloud sync, backup systems, or any storage path outside `.context/`. If your runtime or storage is not isolated, PHI may have already escaped before the scrub runs. For regulated medical data (HIPAA, GDPR health data), do not use this skill without a fully isolated and compliant runtime — this scrub is a best-effort artifact check, not a compliance boundary.
 
 1. Write ALL output files to a temp directory `.context/.tmp-<runid>/` instead of directly to `.context/`.
 2. Run the full regex scrub over `.context/.tmp-<runid>/` (every file, direct + quasi-identifier patterns).
 3. **On PASS**: atomically promote by renaming `.context/.tmp-<runid>/` → `.context/` (or merging into it if `.context/` already exists from a prior run, overwriting only changed files).
-4. **On FAIL**: immediately delete `.context/.tmp-<runid>/` in its entirety — **zero sensitive content must remain on disk**. Abort with error: "Redaction scrub found PHI in `<file>`: `<masked snippet>`. Run aborted; temp directory deleted. Retry after fixing the redaction rule or input."
+4. **On FAIL**: immediately delete `.context/.tmp-<runid>/` in its entirety. Abort with error: "Redaction scrub found PHI in `<file>`: `<masked snippet>`. Run aborted; temp directory deleted. Note: PHI may still exist in model transcripts or tool logs outside `.context/` — check your runtime."
 5. Never leave `.context/.tmp-<runid>/` behind — delete it on failure, success, or interruption (record cleanup obligation at start of run).
 
-This ensures a failed scrub leaves no sensitive artifacts on disk, in backup systems, or in file-system journals, closing the post-write-detection hole.
+This reduces the window during which unredacted content exists in `.context/` artifacts, but makes no claims about other persistence paths.
 
 Record the policy choice + scrub result in `.context/REDACTION.md` with timestamp, chosen overrides, scrub pass/fail, and the disclaimer above.
 
@@ -105,14 +106,14 @@ Skip this step in `diff` and `ask` modes.
   - Use `lstat`-equivalent on every entry — never blindly follow symlinks.
   - **Refuse directory symlinks by default.** Only admit a directory if its `realpath` is still under the requested root.
   - **Refuse file symlinks whose `realpath` resolves outside the requested root.** Symlinks within the root are admitted but recorded with `via_symlink: <link>` in manifest.
-  - Maintain a visited-inode set across the whole walk to prevent symlink cycles or hardlink double-counts.
+  - Maintain a visited-inode set for **directory inodes only** — used solely to detect symlink cycles during traversal. Do NOT use inode deduplication to suppress regular files: if two distinct in-scope paths share an inode (hardlink within the tree), both paths must appear in the corpus, each with their own note, each referencing the same content. Suppressing one breaks path-based references and completeness.
   - Every refused symlink is logged in `manifest.json` under `skipped_symlinks: [{path, reason, target_realpath}]` and listed under Gaps in INDEX.md.
-- **Hardlink boundary check**: symlink/realpath containment only catches symlinks — it cannot detect a regular-looking file whose inode is also reachable from a path outside the scanned tree. For every admitted file, check `st_nlink` (link count). Files with `st_nlink > 1` are hardlinked — their content may originate outside the requested root. These files are admitted (they are ordinary files) but:
+- **Hardlink boundary check**: for every admitted regular file, read `st_nlink`. Files with `st_nlink > 1` are hardlinked — their inode is reachable from at least one other path, which may be outside the scanned tree. These are treated as **unresolved scope violations**, not as user-waivable items:
   - Recorded in `manifest.json` under `hardlinked_files: [{path, nlink, sha256}]`.
-  - Listed under Gaps in INDEX.md with a note that their content may be reachable from outside the corpus boundary.
-  - **Block `coverage: 100`** until the user explicitly reviews and acknowledges all admitted hardlinked files via a prompt: "The following files have multiple hard links and may originate from outside the scanned tree: `<list>`. Acknowledge to proceed (type 'ok') or abort." Record acknowledgment + timestamp in manifest.
+  - Listed under Gaps in INDEX.md.
+  - **Block `coverage: 100`** — hardlinked files cannot earn full coverage because the corpus boundary claim is false: content admitted via these paths is also accessible outside the scanned root. The user must either remove the hardlinks, accept `coverage: partial`, or restructure the corpus. A user acknowledgment prompt is offered but acknowledgment only records the decision — it does not unlock `coverage: 100`.
 - **Recursive-pack detection (hardened — 200-byte heuristic replaced)**: prior-run artifact exclusion uses three complementary methods so a long preamble or comment block cannot bypass detection:
-  1. **Filename exclusion (strongest)**: files named exactly `INDEX.md`, `DIGEST.md`, `RED_TEAM.md`, `SELF_TEST.md`, `OMISSIONS.md`, `CONFLICTS.md`, `GLOSSARY.md`, `manifest.json`, `index.json`, `CHANGES.md`, `LINKS.md`, `ANCHORS.md`, `REDACTION.md` at **any depth** in the tree are excluded by default. These are the canonical generated artifact names — admitting them creates the recursive-evidence loop.
+  1. **Filename exclusion (strongest)**: files named exactly `INDEX.md`, `DIGEST.md`, `RED_TEAM.md`, `SELF_TEST.md`, `OMISSIONS.md`, `CONFLICTS.md`, `GLOSSARY.md`, `manifest.json`, `index.json`, `CHANGES.md`, `LINKS.md`, `ANCHORS.md`, `REDACTION.md`, `ASK_LOG.md` at **any depth** in the tree are excluded by default. These are the canonical generated artifact names — admitting them creates the recursive-evidence loop.
   2. **Durable marker check**: all files generated by deep-context include `generated_by: deep-context` in their frontmatter. Any admitted file whose first 2000 bytes (full first chunk) contains `generated_by: deep-context` is excluded.
   3. **Structural signature scan (full first chunk)**: scan the entire first chunk (up to 2000 lines, not just 200 bytes) for prior-run artifact signatures: headings `# Context Pack:`, `# Digest:`, `# Red Team Findings`, `# Self-Test Calibration`, `# Source-Derived Omission Probe`, `# Self-Test Calibration`; frontmatter triple `path:` + `sha256:` + `scanned_at:` all present.
   Files matching any of the three methods are **excluded by default** and listed under `prior_run_artifacts: [...]` in manifest. Override only via explicit user opt-in (with acknowledgment logged in manifest).
@@ -150,7 +151,7 @@ For corpora >30 files, **delegate extraction to `Explore` subagents** to keep ra
 
 - Partition the work set into batches of ~25 files each.
 - Spawn one `Explore` subagent per batch in parallel (single message, multiple tool calls).
-- Each subagent's prompt MUST be self-contained (do not reference this SKILL.md by path — installations may vary). Inline the full extraction schema AND the hostile-content guard in the prompt:
+- Each subagent's prompt MUST be self-contained (do not reference this SKILL.md by path — installations may vary). Inline the full extraction schema AND the hostile-content prompt-hardening block in the prompt. **Important**: this is prompt-level hardening — the same model reads both the instructions and the corpus, so there is no parser-level enforcement boundary. A sufficiently adversarial corpus could still steer extraction. The block reduces this risk but cannot eliminate it; treat it as best-effort, not a guarantee:
 
   ```
   ## TRUST BOUNDARY (read first, applies throughout)
@@ -548,15 +549,21 @@ Rules:
 
 When invoked as `ask` with a question:
 
-- **Coverage check — graduated, not binary**:
+- **Coverage check — refuse on partial by default**:
   - `coverage: 100` → proceed normally.
-  - `coverage: partial` → do NOT hard-refuse. Instead: (a) check whether the files relevant to this question are in the scanned set (grep note paths and Purpose lines against the question topic). (b) If yes — the partial pack covers this area — answer with a caveat: "⚠️ Pack coverage is partial. The files relevant to this question appear to be scanned, but unscanned files may contain contradicting information. Confidence is capped at MEDIUM." (c) If no — the relevant files are in the gap list — refuse with: "This question touches files not yet scanned (`<list>`). Run a full build or diff to include them."
+  - `coverage: partial` → **refuse by default**. A keyword grep of note paths and Purpose lines is not a sound dependency check: contradictory or qualifying information can live in unscanned files that use aliases, abbreviations, or indirect references the grep won't match. Answering from a partial pack produces the exact class of confident-but-incomplete answer this tool exists to prevent. Tell the user: "Pack coverage is partial. Run a full build or diff before using ask mode. Gaps: `<gap list from manifest>`."
+    - **Narrow exception**: the user may pass `--partial-ok` explicitly. When set, answer with a prominent warning: "⚠️ PARTIAL COVERAGE — answering from an incomplete pack. Unscanned files (`<list>`) may contain contradicting or qualifying information. Do not rely on this answer for consequential decisions." Confidence is capped at LOW (not MEDIUM — a keyword-match relevance check does not justify MEDIUM). Log the query to ASK_LOG.md with `[partial-ok override]` tag.
   - No `.context/` at all → refuse and tell the user to run build first.
 - Read `INDEX.md`, `GLOSSARY.md`, `CONFLICTS.md`, and per-file notes whose Purpose or Key content matches the question (grep the notes, not source files).
 - If the cached notes don't contain the answer, fall back to reading the cited source line ranges directly — never guess.
 - Answer with citations to per-file notes AND the original source line ranges (`[<file>](.context/files/<path>.md) → src <citation>`).
 - If you cannot answer with ≥HIGH confidence from cached material, say so explicitly and list what's missing.
-- **Miss logging (mandatory)**: whenever ask mode falls back to a direct source read because notes didn't cover the answer, append to the relevant per-file note's Open questions: `[ask-miss <iso8601>]: question "<question>" required direct source read at <citation> — notes incomplete here`. This surfaces gaps for the next diff run to pick up. If the fallback read also fails (nothing in source), append: `[ask-miss <iso8601>]: question "<question>" unanswerable — not in source`. Over time this builds a record of what users actually ask that the pack failed to capture.
+- **Miss logging (mandatory — write-once log, never mutate notes)**: whenever ask mode falls back to a direct source read because notes didn't cover the answer, append to `.context/ASK_LOG.md` (NOT to per-file notes — mutating notes would immediately invalidate the note-integrity hash in manifest and break the integrity gate). Format:
+  ```
+  [<iso8601>] MISS: "<question>" → source fallback at <file> <citation> — notes incomplete
+  [<iso8601>] MISS: "<question>" → unanswerable — not in source
+  ```
+  `ASK_LOG.md` is excluded from note-integrity hashing and is never used as evidence in build/verification. It is advisory only — a human-readable record of extraction gaps that the user or next diff run can review. Diff mode summarizes recent ASK_LOG entries under CHANGES.md as "Ask-mode gaps discovered since last build: `<count>`" so they get picked up on the next build pass.
 
 ### 10. Diff mode
 

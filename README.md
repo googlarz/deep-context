@@ -38,8 +38,8 @@ What you're paying for vs the built-ins:
 - **Mandatory source citations on every claim** — no claim without a verifiable pointer
 - **Independent red-team pass** — a separate agent tries to *disprove* claims, not confirm them
 - **Source-derived omission probe** — a fourth audit direction that asks "what's NOT in the notes that should be?" — closes the structural blind spot in note-only verification
-- **Hostile-content guard** — corpus content cannot inject instructions into the extractor
-- **Symlink/realpath boundary** — scan stays inside the folder you pointed at, period
+- **Hostile-content prompt-hardening** — explicit trust-boundary instructions in every subagent prompt reduce (but cannot eliminate) the risk of a malicious corpus file steering extraction; best-effort, not a parser-level guarantee
+- **Symlink/realpath boundary** — scan stays inside the folder you pointed at (symlinks and realpath-escaped files refused; hardlinked files flagged and require acknowledgment)
 - **Coverage gate that admits uncertainty** — `coverage: partial` is the honest default when something's incomplete; `coverage: 100` is gated on multiple measured pass rates
 
 The tradeoff is straightforward: roughly 3–10× the tokens of a casual scan, in exchange for an artifact that tells you what it knows, what it doesn't, and why each claim should be believed. If the corpus doesn't matter, don't use this. If it does, the extra cost is the cheapest part of the workflow.
