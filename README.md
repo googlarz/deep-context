@@ -128,4 +128,4 @@ The spec is at the point of diminishing returns — next improvements should com
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[CC BY 4.0](LICENSE) — free for any use including commercial, attribution required (credit Dawid Piaskowski + link to this repo).
