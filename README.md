@@ -128,4 +128,6 @@ The spec is at the point of diminishing returns — next improvements should com
 
 ## License
 
-[CC BY 4.0](LICENSE) — free for any use including commercial, attribution required (credit Dawid Piaskowski + link to this repo).
+[CC BY-NC 4.0](LICENSE) — free for personal and open-source use with attribution.
+
+**Commercial use** (consulting, client work, commercial products): free, but requires a brief notification. Email [googlarz@gmail.com](mailto:googlarz@gmail.com) with your company name and use case — a commercial license is granted by return. No payment, just acknowledgment.
