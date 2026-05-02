@@ -15,9 +15,11 @@ Pick based on user input:
 |------|---------|--------|
 | **build** | folder path + "scan/ingest/build context" | Full workflow (steps 1–8 below) |
 | **build with anchors** | folder + 3–5 anchor questions ("how does X work?") | Build, then verify pack can answer each anchor with HIGH confidence; unanswerable anchors → Gaps |
-| **ask** | existing `.context/` + a question, e.g. `/deep-context ask <folder> "<question>"` | Skip to step 9 — answer from cached notes |
+| **ask** | existing `.context/` + a question, e.g. `/deep-context ask <folder> "<question>"` | Skip to step 9 — answer from cached notes; supports multi-turn via ASK_CONTEXT.md |
 | **diff** | cache hit on rebuild, ≥1 file changed | Run build on changed files only, then write `CHANGES.md` summarizing what's new since last run; run drift detection on dependent notes |
 | **link** | `/deep-context link <folder-a> <folder-b>` | Cross-link two existing packs — see step 11 |
+| **serve** | `/deep-context serve <folder>` | Generate a self-contained MCP server from an existing pack — see step 13 |
+| **watch** | `--watch` flag on any build/diff | After initial build/diff, poll the source folder and auto-trigger diff on changes — see step 14 |
 
 Default to **build** if mode is ambiguous and `.context/` doesn't exist; default to **diff** if it exists and any file changed; default to **ask** if user passes a question alongside an unchanged corpus.
 
@@ -30,11 +32,18 @@ Inside the target folder:
 ```
 <folder>/.context/
 ├── INDEX.md              # human-readable summary + verification report
+├── DIGEST.md             # one-page actionable TL;DR (written at step 8.5)
 ├── CHANGES.md            # written by diff mode — what changed since last run
 ├── CONFLICTS.md          # contradictions between per-file notes (may be empty)
 ├── GLOSSARY.md           # cross-corpus terms and entities (may be empty)
-├── manifest.json         # {path, sha256, size, mtime, scanned_at} per file + run metadata
+├── RED_TEAM.md           # adversarial verification findings
+├── SELF_TEST.md          # self-test calibration results
+├── OMISSIONS.md          # source-derived omission probe results
 ├── ASK_LOG.md            # append-only log of ask-mode misses (excluded from note integrity hashing)
+├── ASK_CONTEXT.md        # rolling multi-turn ask-mode conversation context (last 5 exchanges)
+├── manifest.json         # {path, sha256, size, mtime, scanned_at} per file + run metadata
+├── index.json            # machine-readable summary (JSON sidecar)
+├── server.py             # generated MCP server (written by serve mode only)
 └── files/
     └── <relpath>.md      # one note per source file, mirrors source tree
 ```
@@ -90,6 +99,41 @@ This reduces the window during which unredacted content exists in `.context/` ar
 
 Record the policy choice + scrub result in `.context/REDACTION.md` with timestamp, chosen overrides, scrub pass/fail, and the disclaimer above.
 
+### 0.5. Pre-build token estimation (interactive gate)
+
+**Ordering**: this step runs AFTER a lightweight metadata-only pre-scan (described below) and BEFORE step 1 (full inventory with SHA-256 hashing). Do a metadata-only walk to get counts; step 1 does the expensive hash-and-cache-diff pass.
+
+1. **Metadata-only walk** (no file reads, no hashing — equivalent to `find <folder> -not -path '*/\.*' -type f`):
+   - Apply the same filename/extension exclusion rules as step 1 using only names and extensions.
+   - Count: total files, total disk size (sum of `stat` sizes), PDF count.
+   - Estimated PDF pages: run `pdfinfo` per PDF for page count if available; otherwise assume 10 pages per PDF.
+2. **Rough token estimate** (intentionally conservative):
+   - Text/code/markdown: 600 tokens each (extraction Pass A + Pass B + schema validation).
+   - PDFs: 1,500 tokens per 10 pages.
+   - Verification passes (cross-index, red-team, omission probe, self-test, spot-check): ×3.0 multiplier on raw extraction total.
+   - Example: 50 text files × 600 = 30,000; ×3 = ~90,000 tokens total.
+3. **Show estimate and ask**:
+
+   ```
+   📋 Pre-build estimate
+   Files: <n>  |  Size: <X> MB  |  PDFs: <k> (~<p> pages est.)
+   Est. tokens: ~<T>  |  Est. time: ~<M> min
+   Proceed? [yes / no / adjust-scope]
+   ```
+
+   - **yes** (or `--yes` flag): proceed to step 0 (anchors).
+   - **no**: exit cleanly. Do not modify `.context/`.
+   - **adjust-scope**: ask user to provide a narrower path or additional exclusion patterns; re-run metadata walk and repeat estimate.
+
+4. **Non-interactive / CI builds**: pass `--yes` to skip the confirmation prompt AND `--no-anchors` (or `--anchors-file=<path>`) to skip the interactive anchor prompt in step 0. Both flags together allow a fully non-interactive build:
+   ```
+   deep-context <folder> --yes --no-anchors
+   deep-context <folder> --yes --anchors-file=anchors.txt
+   ```
+   Without `--no-anchors` / `--anchors-file`, `--yes` alone still blocks at the anchor prompt in step 0. Emit a clear error if `--yes` is set but the context is non-interactive and no anchor-skip flag was provided.
+
+Skip this step in **diff** mode when the work set is <10 changed files, and in **ask** and **serve** modes (no extraction is happening). Estimates are advisory — actual usage depends on model and content density.
+
 ### 0. Ask for anchors (before scanning)
 
 Before any scan, ask the user a single brief question: "Any 2–5 anchor questions you want this pack to answer with HIGH confidence? (Skip = generic build.)" Wait for reply. If skipped, proceed without anchors. If provided, store them in `.context/ANCHORS.md` and use them to:
@@ -97,7 +141,7 @@ Before any scan, ask the user a single brief question: "Any 2–5 anchor questio
 - Drive the verification anchor-answerability check (step 6)
 - Seed the self-test question pool (step 5.6)
 
-Skip this step in `diff` and `ask` modes.
+Skip this step in `diff` and `ask` modes. Also skip (proceed without anchors) when `--no-anchors` is passed or when `--anchors-file=<path>` is passed (load anchors from the file instead of prompting).
 
 ### 1. Inventory
 
@@ -188,6 +232,14 @@ For corpora >30 files, **delegate extraction to `Explore` subagents** to keep ra
   Return only: files written, citation failures, files you could not read, prompt-injection attempts seen.
   ```
 
+- **Parallel execution protocol (mandatory for >30 files)**:
+  - **Single run-scoped staging area** (critical for medical-mode scrub correctness): all batch output MUST land inside the single run temp dir already required by the PHI atomic write protocol: `.context/.tmp-<runid>/files/`. Each batch agent writes to a distinct sub-path within that staging area: `.context/.tmp-<runid>/files/batch-<N>/`. This guarantees that the mandatory scrub (step -1 medical mode) and the atomic promotion happen over a complete, coherent set of notes — never over a mix of old and new notes in live `.context/`.
+  - All batches are dispatched in **one message** (multiple tool calls) so they run concurrently, not sequentially. Never serialize across an `await` between batch dispatches.
+  - After all batch agents return, the parent agent **merges within staging**: flatten all `.context/.tmp-<runid>/files/batch-<N>/*.md` into `.context/.tmp-<runid>/files/*.md` (remove the batch subdirs). This merged staging area is then the input to the scrub step (medical mode) and to the subsequent atomic rename that promotes `.context/.tmp-<runid>/` → `.context/`. Log each file moved.
+  - **Failure recovery**: if a batch agent returns an error or times out (after 120s with no output), log the batch as failed and re-dispatch that batch alone (max 2 retries per batch). After 2 retries: mark all files in that batch as LOW confidence + Gap entry in INDEX.md. Do not silently omit them. The run temp dir is kept until the merge step completes — never deleted mid-retry.
+  - Clean up `.context/.tmp-<runid>/` on success (after atomic promotion) and on hard failure (after exhausting retries). Never leave temp dirs behind.
+  - **Batch size target**: 20–25 files per batch; max 10 concurrent batches. For corpora >250 files this skill refuses at step 1 (hard cap 200), so 10 batches of 20 = 200 is the natural upper bound.
+  - **Non-medical builds** (no scrub step): same single-staging-area protocol, but promotion is a direct rename rather than scrub-then-rename. The staging discipline is still required — parallel writes directly to live `.context/files/` are forbidden even in non-medical mode, because an interrupt mid-merge would leave a mixed old/new pack with no recovery path.
 - **Schema validation (mandatory) before accepting subagent output**: parent agent re-reads each `.context/files/*.md` and validates: required frontmatter keys present; all required sections present in order; every Key content/References line has a citation tag matching its source's file type. Any note failing validation is rejected and re-extracted (max 2 retries; then marked LOW confidence + Gap).
 - Subagents must Read+Write only — do not let them modify source files.
 - Main agent then runs steps 5–8 on the resulting notes (cross-index, verification, INDEX, manifest).
@@ -284,6 +336,12 @@ After all per-file notes are written, build:
     - A total claimed in one file doesn't equal the sum of line items stated in another.
   This catches the "March 15 vs 3 months from January" class of contradiction that entity-name matching misses entirely.
   Write `.context/CONFLICTS.md` with both passes' findings, tagged `[explicit]` or `[implicit]`. Empty file is fine — but both passes must run.
+  - *Pass 3 — semantic role/obligation analysis* (spawn as a separate subagent, always with TRUST BOUNDARY block): extract all *roles* (parties, actors, responsible entities) and *obligations* (duties, permissions, prohibitions) from per-file notes. Build a role table: `{entity_name → role_in_doc_X}`. Flag any pair where:
+    - The same real-world entity is assigned *conflicting roles* across documents (e.g., "Party A is licensor" in the contract vs. "Party A pays Party B" in the invoice, making Party A the *licensee* under the payment structure). Co-reference resolution required: "the Company", "Acme GmbH", and "A" may be the same entity — use the GLOSSARY and document context to resolve before comparing.
+    - An obligation stated in one document ("Party B shall deliver by 2025-01-31") is absent or contradicted in another document that covers the same scope and period.
+    - A defined term is used in one document with a meaning that conflicts with its definition in another document in the corpus (e.g., "Net Revenue" defined differently in two contracts between the same parties).
+    Pass 3 runs only when `--domain=legal`, `--domain=finance`, or `--domain=medical`; or when the corpus contains documents that appear to be multi-party agreements, contracts, or invoices (inferred from filenames and GLOSSARY entity types). For code/research/sales domains without multi-party structure, Pass 3 is skipped and noted in CONFLICTS.md.
+  Tag Pass 3 findings as `[semantic]` in CONFLICTS.md.
 - **Glossary**: terms/acronyms/entities appearing in ≥3 files. Write `.context/GLOSSARY.md` with one-line definitions, each cited.
 - **Corpus-level negative space**: aggregate all per-file Does-NOT-cover entries + omission probe soft misses + dangling references that resolve to nothing. Deduplicate and normalize into a corpus-level list of topics the corpus genuinely does not address. This becomes the "Corpus does NOT cover" section in INDEX.md and gives users explicit confirmation that a topic was looked for and not found — rather than leaving them uncertain whether absence means "not there" or "not checked."
 
@@ -410,7 +468,7 @@ Fill this checklist explicitly in INDEX.md. Each line gets ✓ or ✗ with evide
 - [ ] Every TODO/FIXME/HACK in source appears in a per-file note (grep source for `TODO|FIXME|HACK|XXX` and cross-check)
 - [ ] Every cross-reference resolves (or is listed under "dangling references")
 - [ ] Every file mentioned in docs/READMEs exists in the corpus (or is flagged missing)
-- [ ] CONFLICTS.md, GLOSSARY.md, RED_TEAM.md, SELF_TEST.md exist (may be empty, but must exist)
+- [ ] CONFLICTS.md, GLOSSARY.md, RED_TEAM.md, SELF_TEST.md, OMISSIONS.md exist (may be empty, but must exist)
 - [ ] Red team pass executed by *different* subagents than the extractors. Failures demoted to LOW and listed.
 - [ ] Self-test calibration run. Empirical pass rate reported.
 - [ ] If anchor questions provided: each anchor answered with HIGH confidence using only `.context/`. Unanswerable anchors → Gaps.
@@ -422,7 +480,8 @@ Fill this checklist explicitly in INDEX.md. Each line gets ✓ or ✗ with evide
 - [ ] **DIGEST.md completeness (hard gate)**: verify DIGEST.md exists, is non-empty, and contains all six required sections: `## TL;DR`, `## Key numbers`, `## Timeline`, `## Decision points / open actions`, `## Risks / red flags`, `## Next likely steps`. A missing section or a section with only placeholder text (`<...>`, "N/A", or fewer than 2 substantive bullet points) fails this check and blocks `coverage: 100`. This is structural — the aggregation rules below are separate.
 - [ ] **DIGEST aggregation verified**: for every scalar total in DIGEST.md — (a) unique entity key documented and confirmed, (b) deduplication applied and confirmed (same entity mentioned across N docs counted once), (c) currency/unit normalization documented, (d) contributing note IDs listed, (e) completeness status stated. Any total missing any of these five → Gaps entry + `coverage: partial`. Totals that cannot satisfy all five must be replaced with prose in DIGEST.md before `coverage: 100` is possible.
 - [ ] Hardlinked files reviewed: all files listed under `hardlinked_files` in manifest have been acknowledged by the user before `coverage: 100`.
-- [ ] Coverage gate: spot-check pass rate ≥95% AND red team pass rate ≥90% AND self-test pass rate ≥90% AND omission probe pass rate ≥90% AND every anchor answered AND zero LOW-confidence files unflagged in Gaps AND (for PDFs) `pages_read == pages_total` AND end-of-document signature verified AND (for chunked text files) `lines_read == lines_total` AND no admitted file is a prior-run artifact AND every refused symlink reviewed AND **DIGEST.md complete (all 6 sections, non-empty)** AND all DIGEST aggregates verified AND all hardlinked files acknowledged → only then mark `coverage: 100`. Citation-format violations (using `(L<a>-L<b>)` on a PDF claim, etc.) count as failures and bar `coverage: 100`.
+- [ ] **Semantic contradiction pass 3**: if domain is legal/finance/medical OR corpus contains multi-party agreements/contracts/invoices (auto-detected), verify that `index.json` records `semantic_contradiction_pass_ran: true`. If pass 3 was applicable but `semantic_contradiction_pass_ran` is absent or false, this check fails and blocks `coverage: 100`. If pass 3 was not applicable (code/research/sales corpus, no multi-party structure), record `semantic_contradiction_pass_ran: false, semantic_contradiction_pass_skipped_reason: "<why>"` and mark this check ✓ with that reason. Pass 3 skipped without a documented reason is treated as a failure.
+- [ ] Coverage gate: spot-check pass rate ≥95% AND red team pass rate ≥90% AND self-test pass rate ≥90% AND omission probe pass rate ≥90% AND every anchor answered AND zero LOW-confidence files unflagged in Gaps AND (for PDFs) `pages_read == pages_total` AND end-of-document signature verified AND (for chunked text files) `lines_read == lines_total` AND no admitted file is a prior-run artifact AND every refused symlink reviewed AND **DIGEST.md complete (all 6 sections, non-empty)** AND all DIGEST aggregates verified AND all hardlinked files acknowledged AND semantic contradiction pass 3 ran or documented-skipped → only then mark `coverage: 100`. Citation-format violations (using `(L<a>-L<b>)` on a PDF claim, etc.) count as failures and bar `coverage: 100`.
 
 If any check fails: do not mark `coverage: 100`. List the failures in INDEX.md under "Gaps".
 
@@ -480,6 +539,7 @@ Write `manifest.json`:
 ```json
 {
   "run": {
+    "run_id": "<started_at ISO8601 + first 8 chars of corpus root SHA>",
     "started_at": "...",
     "finished_at": "...",
     "coverage": 100,
@@ -549,6 +609,22 @@ Rules:
 ### 9. Ask mode
 
 When invoked as `ask` with a question:
+
+- **Multi-turn conversation context**: ask mode maintains a rolling conversation window so follow-up questions don't start cold. Before answering, read `.context/ASK_CONTEXT.md` (if it exists) and prepend the last ≤5 exchanges to the question context. This lets "what about the deadline for that?" correctly refer back to the entity discussed in the previous turn.
+  - After each answer, append the exchange to `ASK_CONTEXT.md`:
+    ```
+    ---
+    [<iso8601>] [run_id: <manifest_run_id>] Q: <full question as asked>
+    A: <one-paragraph answer summary with citations>
+    ---
+    ```
+    Each entry is stamped with the manifest run_id (from `manifest.json run.started_at` + a short hash, or a `run_id` field added there). This allows stale-entry detection.
+  - Keep at most 5 exchanges in the file (trim oldest on overflow). `ASK_CONTEXT.md` is excluded from note-integrity hashing (same reason as `ASK_LOG.md` — it's a write-append side-channel, not a content claim).
+  - **Staleness gate**: before prepending context, compare each stored entry's `run_id` to the current manifest `run_id`. Entries from a different run_id (i.e., the pack was rebuilt or diff'd since that exchange) are **excluded from the context window** and marked `[stale — pack rebuilt since this exchange]`. Do not silently feed stale summaries into a follow-up answer; this is the primary way context misleads after a diff. If all stored exchanges are stale, behave as if no context exists for this query.
+  - **`--reset-context` flag**: clear `ASK_CONTEXT.md` before answering. Use when switching to an unrelated topic or when the conversation context is causing confusion.
+  - **`--no-context` flag**: read but don't update `ASK_CONTEXT.md` for this query. Use for one-off lookups where conversation continuity is unwanted.
+  - **Diff mode**: after completing a diff run, append a sentinel to `ASK_CONTEXT.md`: `[<iso8601>] PACK UPDATED (run_id: <new_run_id>) — context from prior pack is stale`. This makes the invalidation visible in the file even if the user inspects it manually.
+  - Note: multi-turn context applies to coreference resolution ("that deadline", "the second party") — it does not expand the answer source beyond the notes. The answer always comes from cached notes + cited source fallbacks, never from the conversation history itself.
 
 - **Coverage check — refuse on partial by default**:
   - `coverage: 100` → proceed normally.
@@ -663,7 +739,12 @@ Alongside `INDEX.md`, write `.context/index.json` for programmatic consumption:
     "omission_probe_ci_low": <%>,
     "omission_probe_n": <n>,
     "note_integrity_pass": true,
-    "notes_with_hash_mismatch": []
+    "notes_with_hash_mismatch": [],
+    "semantic_contradiction_pass_ran": true,
+    "semantic_contradiction_pass_skipped_reason": null,
+    "semantic_conflicts_found": <n>,
+    "extraction_batches": <n>,
+    "extraction_batches_failed_and_recovered": <n>
   },
   "anchors": [{"question": "...", "answered": true, "confidence": "HIGH"}],
   "hot_files": [{"path": "...", "inbound": <n>}],
@@ -687,6 +768,87 @@ Alongside `INDEX.md`, write `.context/index.json` for programmatic consumption:
 ```
 
 This file is the canonical machine-readable summary; INDEX.md is the human-readable view of the same data.
+
+### 13. Serve mode (MCP server from context pack)
+
+When invoked as `/deep-context serve <folder>`:
+
+**Precondition**: `.context/manifest.json` must exist with `coverage: 100`. Refuse if missing or `coverage: partial` — a partial pack produces confidently-wrong answers with no coverage disclosure.
+
+Generate `.context/server.py` — a self-contained MCP server that exposes the context pack as queryable tools. The generated server:
+
+1. **On startup**: loads `manifest.json`, `INDEX.md`, `DIGEST.md`, `GLOSSARY.md`, `CONFLICTS.md`, and all `files/*.md` into memory. Also loads `index.json` for metrics. Validates that all note SHA-256 hashes still match manifest (integrity check on serve; refuse to start if any mismatch).
+
+2. **Exposes these MCP tools**:
+
+   | Tool | Input | Returns |
+   |------|-------|---------|
+   | `search_notes` | `query: str, top_k?: int (default 3)` | **Retrieval only, not answering**: tokenize query into keywords; rank per-file notes by keyword hit density in Purpose + Key content; return top-k ranked excerpts as `[{note_path, excerpt, citation, note_confidence}]`. No synthesis, no answer — the connecting Claude session reads these excerpts and forms an answer. Calling this tool is equivalent to a structured grep of the notes. If nothing matches: `[]`. |
+   | `get_note` | `path: str` | Full content of `.context/files/<path>.md` |
+   | `list_files` | (none) | Array of `{path, purpose, confidence, inbound_refs}` from all notes |
+   | `get_digest` | (none) | DIGEST.md content |
+   | `get_conflicts` | (none) | CONFLICTS.md content |
+   | `get_metrics` | (none) | Parsed `index.json` metrics block (pass rates, CIs, coverage status, semantic pass status) |
+   | `get_glossary` | `term?: str` | GLOSSARY.md content, or filtered to matching term |
+   | `get_staleness` | (none) | `{pack_age_days, files_drifted, stale_warning, run_id}` from index.json |
+
+   **Deliberate design choice**: there is no `answer()` or `query()` tool that returns a synthesized answer with a confidence score. That would require LLM inference inside the server, which is expensive, slow, and introduces a second model call that the MCP client (Claude) cannot see. Instead, `search_notes` returns raw excerpts and the calling Claude session synthesizes. This makes the reasoning chain explicit and auditable.
+
+3. **Never reads source files** — only `.context/`. If a connecting session needs source content for a fallback, the `search_notes` result includes the citation (`note path → src <citation>`), and the caller decides whether to read source directly.
+
+4. **Implementation instructions** (Claude writes `server.py` using these constraints):
+   - Uses the `mcp` Python package (`pip install mcp`). Import: `from mcp.server.fastmcp import FastMCP`.
+   - All file I/O at startup only (load-once, serve-many). Notes are stored as parsed dicts keyed by `path`.
+   - `search_notes()` implementation: tokenize query into keywords; rank notes by keyword hit count in Purpose + Key content; return top-k results as structs, not prose. No LLM inference inside the server — pure keyword matching. Caller (Claude) handles synthesis.
+   - Integrity check on startup: re-hash each note file and compare to `manifest["notes"]`. Log mismatches to stderr; refuse to serve results for mismatched notes (return integrity-fail struct with note path so caller can decide).
+   - Exposes server metadata via `get_metrics()` so connecting sessions can see pack age and coverage status before trusting answers.
+
+5. **After writing `server.py`**, print registration instructions:
+   ```
+   MCP server written: <folder>/.context/server.py
+   
+   To register with Claude Code, add to ~/.claude/settings.json:
+   {
+     "mcpServers": {
+       "deep-context-<folder-basename>": {
+         "command": "python",
+         "args": ["<abs-path-to-folder>/.context/server.py"]
+       }
+     }
+   }
+   
+   Then restart Claude Code and query with: query("your question")
+   ```
+
+**Idempotent**: re-running `serve` regenerates `server.py` from the current pack. Does not touch notes or manifest.
+
+**Security note**: the server only serves from `.context/` — it cannot read source files, cannot write anything, and does not execute code from the corpus. The `server.py` itself is generated code; users should review it before adding to their Claude config.
+
+### 14. Watch mode
+
+When `--watch` is passed with any build or diff invocation, after the initial build/diff completes, enter a polling loop that auto-triggers diff when source files change.
+
+**Trigger**: `deep-context <folder> --watch` or `deep-context <folder> --watch --interval=<seconds>`.
+
+**Protocol**:
+
+1. After initial build/diff completes (including all verification), snapshot the current manifest (file hashes + mtimes).
+2. Every `--interval` seconds (default: 30s; minimum: 10s), stat every file in the current inventory.
+3. **Two-phase change detection** (required — mtime/size alone misses same-size rewrites, atomic replaces, and timestamp-skew scenarios):
+   - **Phase 1 (fast, metadata)**: compare mtime and size against snapshot. Files with unchanged mtime AND unchanged size are presumed unchanged and skipped.
+   - **Phase 2 (definitive, hash)**: for every file that Phase 1 flagged as potentially changed, compute SHA-256 and compare to the snapshot hash. Only trigger diff for files where the hash actually differs. This prevents false-negative misses from preserved-timestamp writes and false-positive triggers from backup tools that touch mtimes.
+4. If any file's **hash** differs from the snapshot:
+   - Emit: `⟳ Change detected: <changed-files>. Running diff...`
+   - Run diff mode (step 10) on the changed set.
+   - After diff completes, update the snapshot and re-emit the summary line.
+4. If the user adds or deletes files in the source folder, detect them in the stat sweep and include them in the diff work set.
+5. **Debounce**: if multiple files change within a 5-second window, collect all changes into one diff run rather than triggering one per file.
+6. **Graceful exit**: stop polling when the user sends an interrupt (Ctrl-C or equivalent in the invoking context). Print: "Watch mode stopped. Last build: <iso8601>."
+7. **Watch mode does not keep Claude's context window open indefinitely** — it uses a scheduled re-check approach (ScheduleWakeup) rather than a blocking sleep. Each poll fires a new turn that checks stats and returns immediately if nothing changed. This allows other Claude work to proceed between polls.
+
+**Not recursive**: watch mode does not watch `.context/` itself — only the source folder. Changes to `.context/` (e.g., a manual note edit) do not trigger a re-diff.
+
+**Integration with serve mode**: if `--watch --serve` is passed together, regenerate `server.py` after each successful diff (so the MCP server always reflects the current pack). The server must be restarted by the user to pick up new data — hot reload is not guaranteed.
 
 ## Reporting back to user
 
