@@ -1,130 +1,152 @@
 # deep-context
 
-> Build verified, comprehensive context packs from a folder — with citations, contradiction detection, self-test calibration, and a one-page actionable digest. A [Claude Code](https://claude.com/claude-code) skill.
+> You have years of notes, journals, contracts, or code. What do they actually say? `deep-context` reads every file, extracts verified, cited notes, detects contradictions, and produces a one-page digest you can trust. A [Claude Code](https://claude.com/claude-code) skill.
 
-## What it does
+## The problem
 
-Point `deep-context` at a folder (≤200 text files). It reads every file, extracts structured per-file notes with **mandatory source citations**, cross-indexes references, detects contradictions, runs a red-team pass and self-test calibration, and produces:
+You have a folder that matters — years of personal notes, a research archive, a dossier of contracts, a codebase you inherited. You ask Claude to "read everything and tell me what it says." Claude reads some of it, tells you something confident, and you have no idea whether it's accurate, what it missed, or whether two files contradict each other.
 
-- **`INDEX.md`** — structural map: hot files, orphans, dangling references, verification report.
-- **`DIGEST.md`** — one-page TL;DR: aggregated numbers, timeline, decision points, risks, next steps. **This is what you actually read.**
-- **Per-file notes** with line- or page-level citations to the source.
-- **`CONFLICTS.md`** — claims that disagree across documents.
-- **`GLOSSARY.md`** — terms/entities appearing in ≥3 files.
-- **`RED_TEAM.md`** — independent skeptical re-read findings.
-- **`SELF_TEST.md`** — empirical accuracy on 10–20 self-generated questions.
-- **`manifest.json`** + **`index.json`** — machine-readable summaries with hashes and metrics.
+`deep-context` fixes this. It reads every file, extracts structured notes with **mandatory source citations**, detects contradictions across documents, runs an independent adversarial check, and tells you explicitly what it found, what it didn't, and why each claim should be believed.
 
-## Why
+## What it produces
 
-Most context-loading is RAG: retrieve at query time, rediscover knowledge each call. `deep-context` does the opposite — it **compiles** a persistent, citation-grounded artifact once, then queries it.
+```
+<folder>/.context/
+├── DIGEST.md         ← read this first: one-page TL;DR with aggregated numbers, timeline, risks
+├── INDEX.md          ← structural map: hot files, orphans, contradictions, verification report
+├── CONFLICTS.md      ← claims that disagree across documents
+├── GLOSSARY.md       ← terms and entities appearing in ≥3 files
+├── RED_TEAM.md       ← independent adversarial re-read findings
+├── SELF_TEST.md      ← empirical accuracy: questions answered from notes alone, graded against source
+├── manifest.json     ← SHA-256 hashes + coverage status + quality metrics
+└── files/
+    └── <relpath>.md  ← one cited note per source file
+```
 
-It's designed for the cases where "scan everything thoroughly" is actually tractable: a focused dossier, a small repo, a research folder, a dossier of contracts. At ≤200 files, full reads are cheap; the value is in **verified completeness** and an **actionable digest**, not retrieval latency.
+## Who uses this
 
-## When to use this over built-in context tools
+### Personal knowledge and journals
 
-The default context-loading paths in agents (raw `Read`, glob+grep, naive RAG retrieval, "just paste it in") are usually fine for casual exploration — and they're cheaper. But they share a failure mode that matters when the corpus is consequential: **you don't know what was missed, what was hallucinated, or whether the answer the agent gave you is actually grounded in the source.**
+You've been keeping notes for years — journals, daily logs, research notes, meeting summaries, an Obsidian vault, exported Notion pages. You want to know: what patterns emerge? What decisions have I revisited? What contradicts what I said last year?
 
-Use `deep-context` when the cost of a confidently-wrong answer is higher than the cost of extra tokens:
+```
+> Build context for ~/notes/2020-2024
+```
 
-- **Legal / contracts / regulatory** — a missed clause or a hallucinated deadline is expensive
-- **Financial dossiers** — an aggregated total that secretly double-counts or skips a currency conversion is worse than no total at all
-- **Medical / clinical** — built-ins have no PHI awareness; this skill has explicit (best-effort) redaction policy
-- **Audit, due diligence, M&A** — you need an artifact you can defend, with citations
-- **Research synthesis where the conclusions will be cited** — you need to know what the corpus actually says vs what the agent imagined
-- **Any "trust me" output you'd be embarrassed to find was wrong**
+deep-context reads every file, cross-indexes references between entries, flags where your views on a topic shifted over time (logged as contradictions), and produces a timeline and digest of what your notes actually contain — cited, so you can verify any claim against the source entry.
 
-What you're paying for vs the built-ins:
-- **Mandatory source citations on every claim** — no claim without a verifiable pointer
-- **Independent red-team pass** — a separate agent tries to *disprove* claims, not confirm them
-- **Source-derived omission probe** — a fourth audit direction that asks "what's NOT in the notes that should be?" — closes the structural blind spot in note-only verification
-- **Hostile-content prompt-hardening** — explicit trust-boundary instructions in every subagent prompt reduce (but cannot eliminate) the risk of a malicious corpus file steering extraction; best-effort, not a parser-level guarantee
-- **Symlink/realpath boundary** — scan stays inside the folder you pointed at (symlinks and realpath-escaped files refused; hardlinked files flagged and require acknowledgment)
-- **Coverage gate that admits uncertainty** — `coverage: partial` is the honest default when something's incomplete; `coverage: 100` is gated on multiple measured pass rates
+### Contracts, legal, and financial documents
 
-The tradeoff is straightforward: roughly 3–10× the tokens of a casual scan, in exchange for an artifact that tells you what it knows, what it doesn't, and why each claim should be believed. If the corpus doesn't matter, don't use this. If it does, the extra cost is the cheapest part of the workflow.
+A missed clause or a hallucinated deadline is expensive. deep-context was refined on a real German legal corpus and handles PDFs with sub-page citations (`p3 ¶2`), cross-document entity tracking, and semantic role/obligation analysis (catches "Party A is licensor in the contract but payer in the invoice").
+
+```
+> Build context for ~/dossier --domain=legal
+```
+
+### Research and literature
+
+A folder of papers, transcripts, or reports. What are the key findings? Which papers contradict each other? What terms does the literature use that aren't in your own notes?
+
+```
+> Build context for ~/research/lithium-batteries --domain=research
+```
+
+### Code you didn't write
+
+Point it at a repo or module directory. It maps inbound/outbound dependencies, flags orphaned files, extracts TODOs and open questions, and tells you what the code does — not what it says it does.
+
+```
+> Build context for ~/projects/legacy-api/src
+```
+
+## Why not just ask Claude to read the folder?
+
+That works fine for casual exploration. The failure mode is invisible: you get a confident answer, you don't know what was missed, and you can't verify any specific claim without re-reading the source yourself.
+
+Use deep-context when the cost of a confidently-wrong answer is higher than the cost of extra tokens:
+
+- Every claim has a verifiable source citation — no claim without a pointer
+- An independent subagent tries to *disprove* notes, not confirm them
+- A source-derived omission probe asks "what's in the raw files that the notes don't cover?"
+- `coverage: partial` is the honest default when something's incomplete — the tool tells you what it missed rather than pretending it got everything
+
+The tradeoff: roughly 3–10× the tokens of a casual read, in exchange for an artifact that tells you what it knows, what it doesn't, and why each claim should be believed.
 
 ## Modes
 
-| Mode | Trigger | Action |
-|------|---------|--------|
-| **build** | folder + "scan/ingest/build context" | Full workflow — reads every file, writes the pack |
-| **build with anchors** | folder + 3–5 anchor questions | Build, then verify each anchor is HIGH-confidence answerable |
-| **ask** | existing `.context/` + a question | Answer from cached notes with dual citations |
-| **diff** | rebuild on changed files only | Cache hit + writes `CHANGES.md`; runs drift detection |
-| **link** | two folders | Cross-link two packs with shared entities + cross-pack conflicts |
+| Mode | Trigger | What happens |
+|---|---|---|
+| **build** | `Build context for <folder>` | Full run: reads every file, extracts notes, verifies, writes pack |
+| **build with anchors** | folder + 2–5 questions | Build, then verify the pack can answer each question at HIGH confidence |
+| **ask** | `Ask <folder>: <question>` | Answer from cached notes with dual citations (note + source location) |
+| **diff** | any rebuild after changes | Re-scans changed files only; writes `CHANGES.md`; flags dependent notes for refresh |
+| **link** | `Link <folder-a> <folder-b>` | Cross-links two packs — shared entities, cross-pack contradictions |
+| **serve** | `Serve <folder>` | Generates `server.py`: a local MCP server other Claude sessions can query |
+| **watch** | `--watch` on any build | Polls for changes and auto-triggers diff |
 
-## Quality gates (`coverage: 100` requires all of these)
+## Quality gates
 
-- Every claim carries a source citation (`L<a>-L<b>` for text, `(p<n> ¶<m>)` for PDFs).
-- Spot-check audit ≥ 95% pass rate
-- Red-team independent re-read ≥ 90% pass rate (subagent for ≥10 files; inline for smaller corpora, flagged)
-- Self-test calibration ≥ 90% empirical accuracy
-- Every anchor question answerable from notes alone
+`coverage: 100` requires all of these. If any fails, the pack reports `coverage: partial` and lists every gap explicitly.
+
+- Every claim cites a source (`L12-L18` for text, `p3 ¶2` for PDFs, `Sheet1!B2` for spreadsheets)
+- Spot-check audit: ≥95% of sampled claims verified against source, CI lower bound ≥85%
+- Red-team pass: ≥90% of notes survive adversarial re-read
+- Self-test accuracy: ≥90% on questions answered from notes alone (factual + cross-file synthesis, reported separately)
+- Omission probe: ≥90% of raw source slices — prioritizing dates, amounts, names, decisions — are covered in notes
 - For PDFs: `pages_read == pages_total`, end-of-document signature verified
-- Zero LOW-confidence files unflagged in Gaps
-
-If any gate fails, coverage is `partial` — gaps explicitly listed.
+- DIGEST.md: all 6 sections present and non-empty
 
 ## Installation
-
-Clone into your Claude Code skills directory:
 
 ```bash
 git clone https://github.com/googlarz/deep-context.git ~/.claude/skills/deep-context
 ```
 
-Or symlink if you want to track upstream changes:
+After that, the skill is available in any Claude Code session. Trigger it naturally:
 
+```
+> Scan this folder and tell me what's in it: ~/Documents/contracts/2024
+> Build context for the notes I took this year
+> What does my research folder actually say about sleep and HRV?
+```
+
+**PDFs require `pdfinfo`:**
 ```bash
-git clone https://github.com/googlarz/deep-context.git
-ln -s "$(pwd)/deep-context" ~/.claude/skills/deep-context
+brew install poppler   # macOS
+apt install poppler-utils  # Linux
 ```
 
-After installation, the skill is discoverable in any Claude Code session. Invoke it by passing a folder path with phrasing like "scan this folder" or "build context for `<path>`".
+## Flags
 
-## Usage
+- `--domain=<legal|code|sales|research|finance|medical>` — loads domain-specific extraction (structured fields for contracts, lab values, API surfaces, etc.)
+- `--yes` — skip the pre-build cost estimate prompt (for scripted or CI use)
+- `--no-anchors` — skip the anchor question prompt
+- `--watch` — poll for changes after build and auto-diff
+- `--partial-ok` — allow `ask` mode on partial-coverage packs (answers capped at LOW confidence, with explicit warning)
 
-```
-> Build context for /path/to/folder
-```
+## The 200-file limit
 
-Optional flags:
+The verification ceremony — adversarial re-read, omission probe, self-test calibration — earns its cost at ≤200 files. Above that, the sample rates become statistically thin and the token cost becomes prohibitive.
 
-- `--domain=<legal|code|sales|research|finance|medical>` — load a domain-specific extraction template.
-- Anchor questions — provide 2–5 questions and the pack will be verified to answer each.
+**If your corpus is larger:** use the folder-of-folders approach. Split into thematic subdirectories (by year, by topic, by project), run deep-context on each, then use `link` mode to connect the packs. The linked packs share a GLOSSARY and CONFLICTS.md that spans all of them.
 
-## Output structure
+A native hierarchical mode (sub-packs → meta-pack) is on the roadmap.
 
-```
-<folder>/.context/
-├── INDEX.md              # structural map + verification report
-├── DIGEST.md             # one-page actionable TL;DR
-├── ANCHORS.md            # user-supplied anchor questions
-├── CHANGES.md            # diff-mode output (only if rebuilding)
-├── CONFLICTS.md          # contradictions across documents
-├── GLOSSARY.md           # cross-document terms
-├── RED_TEAM.md           # adversarial verification
-├── SELF_TEST.md          # empirical accuracy calibration
-├── LINKS.md              # cross-pack links (link mode only)
-├── manifest.json         # SHA-256 hashes + run metadata
-├── index.json            # machine-readable summary
-└── files/
-    └── <relpath>.md      # one note per source file, mirrors source tree
-```
+## The `.context/` format
+
+The output directory follows an open schema defined in [`CONTEXT_SCHEMA.md`](CONTEXT_SCHEMA.md). Any tool that writes compliant `.context/` output — a health tracking skill, a legal MCP, a code-review agent — produces artifacts that deep-context can verify and query. The format is designed to be the layer between "raw files" and "trusted answers," independent of how the notes were produced.
 
 ## Limitations
 
-- **Hard cap: 200 files.** Beyond that, the verification ceremony stops earning its cost; use a retrieval-based approach instead.
-- **PDFs require `pdfinfo`** (poppler-utils) for page-count probing. Install via `brew install poppler` on macOS.
-- **Coverage `partial` is normal** when the corpus references documents not in the folder. The skill flags those — it doesn't hallucinate.
-- **Skill is a workflow specification**, not code. The Claude Code agent executes the steps; quality depends on the model running it.
+- **Hard cap: 200 files.** See above for workaround.
+- **PDFs require `pdfinfo`** (poppler-utils). Without it, page-count safety checks cannot run.
+- **Coverage `partial` is normal** when the corpus references external documents. The skill flags what's missing — it doesn't hallucinate.
+- **This is a workflow specification**, not compiled code. Claude Code executes the steps; quality scales with the model running it.
+- **Medical-mode redaction is best-effort**, not HIPAA-grade. See the SKILL.md disclaimer before using with regulated health data.
 
 ## Provenance
 
-Built incrementally across one long session, refined through a real run on a 7-PDF German legal corpus. Lessons from that run drove four real spec fixes that v1 missed (PDF skip rule, citation format, red-team threshold, anchor prompt). Plus a follow-up round adding sub-page anchors, page-count safety, domain hints, and the digest pass.
-
-The spec is at the point of diminishing returns — next improvements should come from running on different corpus types (code, transcripts, research notes), not more design.
+Built over a series of sessions, refined through a real run on a 7-PDF German legal corpus. Four rounds of adversarial review (Codex) drove the major spec fixes: PDF sub-page citations, CI reporting on pass rates, atomic medical scrub, omission probe bias toward high-stakes content, note integrity hashing.
 
 ## License
 
